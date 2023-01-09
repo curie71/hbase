@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import static org.apache.hadoop.hbase.regionserver.DefaultStoreEngine.DEFAULT_COMPACTION_POLICY_CLASS_KEY;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -30,6 +31,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.ref.SoftReference;
 import java.security.PrivilegedExceptionAction;
@@ -41,12 +43,15 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.NavigableSet;
+import java.util.Optional;
 import java.util.TreeSet;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -103,7 +108,9 @@ import org.apache.hadoop.hbase.quotas.RegionSizeStoreImpl;
 import org.apache.hadoop.hbase.regionserver.ChunkCreator.ChunkType;
 import org.apache.hadoop.hbase.regionserver.MemStoreCompactionStrategy.Action;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionConfiguration;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
 import org.apache.hadoop.hbase.regionserver.compactions.DefaultCompactor;
+import org.apache.hadoop.hbase.regionserver.compactions.EverythingPolicy;
 import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher;
 import org.apache.hadoop.hbase.regionserver.throttle.NoLimitThroughputController;
 import org.apache.hadoop.hbase.regionserver.throttle.ThroughputController;
@@ -1113,6 +1120,68 @@ public class TestHStore {
     verify(spiedStoreEngine, times(1)).replaceStoreFiles(any(), any(), any(), any());
   }
 
+  @Test
+  public void testScanWithCompactionAfterFlush() throws Exception {
+    TEST_UTIL.getConfiguration().set(DEFAULT_COMPACTION_POLICY_CLASS_KEY,
+      EverythingPolicy.class.getName());
+    init(name.getMethodName());
+
+    assertEquals(0, this.store.getStorefilesCount());
+
+    KeyValue kv = new KeyValue(row, family, qf1, 1, (byte[]) null);
+    // add some data, flush
+    this.store.add(kv, null);
+    flush(1);
+    kv = new KeyValue(row, family, qf2, 1, (byte[]) null);
+    // add some data, flush
+    this.store.add(kv, null);
+    flush(2);
+    kv = new KeyValue(row, family, qf3, 1, (byte[]) null);
+    // add some data, flush
+    this.store.add(kv, null);
+    flush(3);
+
+    ExecutorService service = Executors.newFixedThreadPool(2);
+
+    Scan scan = new Scan(new Get(row));
+    Future<KeyValueScanner> scanFuture = service.submit(() -> {
+      try {
+        LOG.info(">>>> creating scanner");
+        return this.store.createScanner(scan,
+          new ScanInfo(HBaseConfiguration.create(),
+            ColumnFamilyDescriptorBuilder.newBuilder(family).setMaxVersions(4).build(),
+            Long.MAX_VALUE, 0, CellComparator.getInstance()),
+          scan.getFamilyMap().get(store.getColumnFamilyDescriptor().getName()), 0);
+      } catch (IOException e) {
+        e.printStackTrace();
+        return null;
+      }
+    });
+    Future compactFuture = service.submit(() -> {
+      try {
+        LOG.info(">>>>>> starting compaction");
+        Optional<CompactionContext> opCompaction = this.store.requestCompaction();
+        assertTrue(opCompaction.isPresent());
+        store.compact(opCompaction.get(), new NoLimitThroughputController(), User.getCurrent());
+        LOG.info(">>>>>> Compaction is finished");
+        this.store.closeAndArchiveCompactedFiles();
+        LOG.info(">>>>>> Compacted files deleted");
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+    });
+
+    KeyValueScanner kvs = scanFuture.get();
+    compactFuture.get();
+    ((StoreScanner) kvs).currentScanners.forEach(s -> {
+      if (s instanceof StoreFileScanner) {
+        assertEquals(1, ((StoreFileScanner) s).getReader().getRefCount());
+      }
+    });
+    kvs.seek(kv);
+    service.shutdownNow();
+  }
+
   private long countMemStoreScanner(StoreScanner scanner) {
     if (scanner.currentScanners == null) {
       return 0;
@@ -1460,6 +1529,106 @@ public class TestHStore {
         assertTrue("expected:" + Bytes.toStringBinary(currentValue) + ", actual:"
           + Bytes.toStringBinary(actualValue), Bytes.equals(actualValue, currentValue));
       }
+    }
+  }
+
+  /**
+   * This test is for HBASE-27519, when the {@link StoreScanner} is scanning,the Flush and the
+   * Compaction execute concurrently and theCcompaction compact and archive the flushed
+   * {@link HStoreFile} which is used by {@link StoreScanner#updateReaders}.Before
+   * HBASE-27519,{@link StoreScanner.updateReaders} would throw {@link FileNotFoundException}.
+   */
+  @Test
+  public void testStoreScannerUpdateReadersWhenFlushAndCompactConcurrently() throws IOException {
+    Configuration conf = HBaseConfiguration.create();
+    conf.setBoolean(WALFactory.WAL_ENABLED, false);
+    conf.set(DEFAULT_COMPACTION_POLICY_CLASS_KEY, EverythingPolicy.class.getName());
+    byte[] r0 = Bytes.toBytes("row0");
+    byte[] r1 = Bytes.toBytes("row1");
+    final CyclicBarrier cyclicBarrier = new CyclicBarrier(2);
+    final AtomicBoolean shouldWaitRef = new AtomicBoolean(false);
+    // Initialize region
+    final MyStore myStore = initMyStore(name.getMethodName(), conf, new MyStoreHook() {
+      @Override
+      public void getScanners(MyStore store) throws IOException {
+        try {
+          // Here this method is called by StoreScanner.updateReaders which is invoked by the
+          // following TestHStore.flushStore
+          if (shouldWaitRef.get()) {
+            // wait the following compaction Task start
+            cyclicBarrier.await();
+            // wait the following HStore.closeAndArchiveCompactedFiles end.
+            cyclicBarrier.await();
+          }
+        } catch (BrokenBarrierException | InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    });
+
+    final AtomicReference<Throwable> compactionExceptionRef = new AtomicReference<Throwable>(null);
+    Runnable compactionTask = () -> {
+      try {
+        // Only when the StoreScanner.updateReaders invoked by TestHStore.flushStore prepares for
+        // entering the MyStore.getScanners, compactionTask could start.
+        cyclicBarrier.await();
+        region.compactStore(family, new NoLimitThroughputController());
+        myStore.closeAndArchiveCompactedFiles();
+        // Notify StoreScanner.updateReaders could enter MyStore.getScanners.
+        cyclicBarrier.await();
+      } catch (Throwable e) {
+        compactionExceptionRef.set(e);
+      }
+    };
+
+    long ts = EnvironmentEdgeManager.currentTime();
+    long seqId = 100;
+    byte[] value = Bytes.toBytes("value");
+    // older data whihc shouldn't be "seen" by client
+    myStore.add(createCell(r0, qf1, ts, seqId, value), null);
+    flushStore(myStore, id++);
+    myStore.add(createCell(r0, qf2, ts, seqId, value), null);
+    flushStore(myStore, id++);
+    myStore.add(createCell(r0, qf3, ts, seqId, value), null);
+    TreeSet<byte[]> quals = new TreeSet<>(Bytes.BYTES_COMPARATOR);
+    quals.add(qf1);
+    quals.add(qf2);
+    quals.add(qf3);
+
+    myStore.add(createCell(r1, qf1, ts, seqId, value), null);
+    myStore.add(createCell(r1, qf2, ts, seqId, value), null);
+    myStore.add(createCell(r1, qf3, ts, seqId, value), null);
+
+    Thread.currentThread()
+      .setName("testStoreScannerUpdateReadersWhenFlushAndCompactConcurrently thread");
+    Scan scan = new Scan();
+    scan.withStartRow(r0, true);
+    try (InternalScanner scanner = (InternalScanner) myStore.getScanner(scan, quals, seqId)) {
+      List<Cell> results = new MyList<>(size -> {
+        switch (size) {
+          case 1:
+            shouldWaitRef.set(true);
+            Thread thread = new Thread(compactionTask);
+            thread.setName("MyCompacting Thread.");
+            thread.start();
+            try {
+              flushStore(myStore, id++);
+              thread.join();
+            } catch (IOException | InterruptedException e) {
+              throw new RuntimeException(e);
+            }
+            shouldWaitRef.set(false);
+            break;
+          default:
+            break;
+        }
+      });
+      // Before HBASE-27519, here would throw java.io.FileNotFoundException because the storeFile
+      // which used by StoreScanner.updateReaders is deleted by compactionTask.
+      scanner.next(results);
+      // The results is r0 row cells.
+      assertEquals(3, results.size());
+      assertTrue(compactionExceptionRef.get() == null);
     }
   }
 

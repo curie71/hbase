@@ -461,6 +461,12 @@
       <timezone>+8</timezone>
     </developer>
     <developer>
+      <id>shahrs87</id>
+      <name>Rushabh Shah</name>
+      <email>shahrs87@apache.org</email>
+      <timezone>-8</timezone>
+    </developer>
+    <developer>
       <id>sakthi</id>
       <name>Sakthi Vel</name>
       <email>sakthi@apache.org</email>
@@ -645,6 +651,12 @@
       <email>bbeaudreault@apache.org</email>
       <timezone>-5</timezone>
     </developer>
+    <developer>
+      <id>heliangjun</id>
+      <name>Liangjun He</name>
+      <email>heliangjun@apache.org</email>
+      <timezone>+8</timezone>
+    </developer>
   </developers>
   <mailingLists>
     <mailingList>
@@ -821,7 +833,7 @@
     <slf4j.version>1.7.30</slf4j.version>
     <clover.version>4.0.3</clover.version>
     <jamon-runtime.version>2.4.1</jamon-runtime.version>
-    <jettison.version>1.5.1</jettison.version>
+    <jettison.version>1.5.2</jettison.version>
     <!--Make sure these joni/jcodings are compatible with the versions used by jruby-->
     <joni.version>2.1.42</joni.version>
     <jcodings.version>1.0.56</jcodings.version>
@@ -3182,7 +3194,7 @@
       <properties>
         <maven.compiler.release>${releaseTarget}</maven.compiler.release>
         <!-- TODO: replicate logic for windows support -->
-        <argLine>-Dio.netty.tryReflectionSetAccessible=true
+        <argLine>-Dorg.apache.hbase.thirdparty.io.netty.tryReflectionSetAccessible=true
           --add-modules jdk.unsupported
           --add-opens java.base/java.nio=ALL-UNNAMED
           --add-opens java.base/sun.nio.ch=ALL-UNNAMED
